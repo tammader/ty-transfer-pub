@@ -78,6 +78,41 @@ def human(b):
     return "%.0f MB" % (b / 1048576) if b < 1024 ** 3 else "%.2f GB" % (b / 1024 ** 3)
 
 
+def probe_dur(ffprobe, path):
+    """ffprobe 取容器时长(秒); 拿不到返回 0.0"""
+    try:
+        out = sh([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                  "-of", "csv=p=0", path], timeout=300).stdout or ""
+    except Exception:
+        return 0.0
+    for ln in out.splitlines():
+        try:
+            v = float(ln.strip())
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return 0.0
+
+
+def probe_dur_packets(ffprobe, path):
+    """容器缺 index/无 duration 时: 顺序解包, 取最后一个视频包的 pts_time 当时长。
+    顺序读不依赖 seek/index, 对 AVI 这类无索引文件有效; 本地文件上跑, 代价可接受。"""
+    try:
+        out = sh([ffprobe, "-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "packet=pts_time",
+                  "-of", "csv=p=0", path], timeout=3600).stdout or ""
+    except Exception:
+        return 0.0
+    vals = []
+    for tok in out.replace(",", "\n").split():
+        try:
+            vals.append(float(tok))
+        except ValueError:
+            pass
+    return max(vals) if vals else 0.0
+
+
 def stem(name):
     """复刻本地 worker: 去扩展名/_D/前缀/.partNNN, 小写"""
     s = os.path.splitext(name)[0]
@@ -380,6 +415,7 @@ def main():
             print("!! 取直链失败: %s" % json.dumps(raw, ensure_ascii=False)[:140])
             continue
         print("直链 OK: %s..." % url[:70])
+        url_remote = url          # 远端直链(整文件下载用); 之后 url 可能被换成本地路径
 
         # 4.2 上传助手: 逐段上传 -> 云端 _D -> 立即删本地
         def upload_parts(plist):
@@ -405,6 +441,22 @@ def main():
                     os.remove(p)
                 except OSError:
                     pass
+
+        def fetch_local():
+            """整文件下到本地(直链 HTTP 直读不稳/拿不到时长时兜底)。
+            源盘下载 40~60MB/s, 代价小; 已下过且大小够就直接复用。"""
+            lp = os.path.join(workdir, name)
+            if os.path.exists(lp) and os.path.getsize(lp) >= f["size"] * 0.98:
+                return lp
+            print("   -> 整文件下载到本地 ...")
+            t_dl = time.time()
+            sh(["curl", "-sL", "-4", "--retry", "3", "--retry-delay", "5",
+                "-o", lp, "--max-time", "7200", url_remote])
+            got_b = os.path.getsize(lp) if os.path.exists(lp) else 0
+            el = max(time.time() - t_dl, 0.1)
+            print("      下载 %s / %.1f 分钟 (%.1f MB/s)"
+                  % (human(got_b), el / 60, (got_b / 1048576) / el))
+            return lp if got_b >= 1024 * 1024 else ""
 
         # 4.3 拿时长(分块/分段都用)
         need_split = f["size"] > MAX_PART
@@ -447,59 +499,33 @@ def main():
         # 4.5 需要切分: 分块处理, 每块单独"切分 -> 逐段上传 -> 删", 峰值磁盘 = 1 块
         BLOCK_BYTES = 3.5 * 1024 ** 3
         if not dur:
-            # 兜底: ffprobe 拿不到时长 -> 按大小切(segment_size), 无需 seek/时长
-            #   小文件(<1.05GB)对半切; 大文件按 SEG_TARGET 分段(1GB 会超 700MB 硬上限)
-            #   峰值磁盘 ≈ 整文件(上方已有磁盘前置检查, 不够会自动跳过)
-            fb = (f["size"] // 2) if f["size"] < 2.4 * SEG_TARGET else SEG_TARGET
-            print("兜底(拿不到时长 -> 按大小切): %.0f MB/段, 峰值磁盘 ≈ %s"
-                  % (fb / 1048576, human(f["size"])))
-            pat = os.path.join(parts_dir, stem_ + ".part%03d" + ext)
-            got = []
-            for attempt in (1, 2):
-                args = [ffmpeg, "-y", "-v", "error", "-i", url, "-c", "copy",
-                        "-f", "segment", "-segment_size", str(int(fb)),
-                        "-reset_timestamps", "1", "-segment_start_number", "0"]
-                if attempt > 1:
-                    # 第 2 次: 允许非关键帧处切 + 收小段长, 保证一定能切开
-                    args += ["-break_non_keyframes", "1"]
-                args += [pat]
-                t_fb = time.time()
-                r = sh(args, timeout=7200)
-                got = [p for p in sorted(glob.glob(os.path.join(parts_dir, stem_ + ".part*")))
-                       if os.path.getsize(p) >= 1024 * 1024]
-                total = sum(os.path.getsize(p) for p in got)
-                print("兜底切分(第%d次): 退出码=%d 用时 %.1f 分钟 %d 段 %s"
-                      % (attempt, r.returncode, (time.time() - t_fb) / 60,
-                         len(got), human(total)))
-                if r.returncode == 0 and got and all(
-                        os.path.getsize(p) <= MAX_SEG_BYTES for p in got):
-                    break
-                print("   失败: %s" % (r.stderr or "").strip()[:160])
-                clean_parts()
-                got = []
-                fb = max(64 * 1024 ** 2, fb * 0.6)
-            if not got:
-                print("!! 兜底切分失败, 停止该文件")
+            # 兜底: 直链上 ffprobe 拿不到时长(CDN 不支持 seek / 容器缺 index)。
+            #   注意: ffmpeg 的 segment muxer **没有** segment_size 选项(只有 *_time),
+            #   所以"按大小切"这条路走不通, 必须先把时长问出来。
+            #   做法: 整文件下到本地 -> 本地 ffprobe 可反复 seek -> 再本地切分。
+            free_b = shutil.disk_usage("/").free
+            if free_b and f["size"] * 2.2 > free_b:
+                print("!! 兜底需先整文件落地(峰值磁盘约 %s), 可用 %s 不足, 跳过该文件"
+                      % (human(f["size"] * 2.2), human(free_b)))
+                failed[stem(name)] = failed.get(stem(name), 0) + 1
+                shutil.rmtree(workdir, ignore_errors=True)
+                continue
+            lp = fetch_local()
+            if not lp:
+                print("!! 兜底: 整文件下载失败, 停止该文件")
+                failed[stem(name)] = failed.get(stem(name), 0) + 1
+                shutil.rmtree(workdir, ignore_errors=True)
+                continue
+            dur = probe_dur(ffprobe, lp) or probe_dur_packets(ffprobe, lp)
+            if not dur:
+                print("!! 兜底: 本地也拿不到时长(容器损坏/无视频流), 停止该文件")
                 failed[stem(name)] = failed.get(stem(name), 0) + 1
                 print("   失败计数: %s -> %d 次 (达 %d 次后不再处理)"
                       % (name, failed[stem(name)], FAIL_MAX))
                 shutil.rmtree(workdir, ignore_errors=True)
                 continue
-            if not upload_parts(got):
-                print("!! 兜底上传中断, 停止该文件")
-                failed[stem(name)] = failed.get(stem(name), 0) + 1
-                shutil.rmtree(workdir, ignore_errors=True)
-                continue
-            r = c.rename(f["id"], DONE_PREFIX + name, f["path"])
-            if str(r.get("code")) == "0":
-                print("✔ 源文件已标记: %s%s" % (DONE_PREFIX, name))
-                ok_cnt += 1
-            else:
-                print("!! 源文件标记失败(记入兜底): %s"
-                      % json.dumps(r, ensure_ascii=False)[:120])
-                new_done.add(stem(name))
-            shutil.rmtree(workdir, ignore_errors=True)
-            continue
+            print("兜底: 本地探测时长 %.1f 秒 -> 改用本地文件切分" % dur)
+            url = lp                  # 之后统一走本地文件(比 HTTP 直读稳)
         chunk = (f["size"] // 2) if (600 * 1024 ** 2) < f["size"] < (1024 ** 3) else SEG_TARGET
         seg = max(60, int(dur * chunk / f["size"])) if dur else 300
         n_blocks = max(1, int((f["size"] + BLOCK_BYTES - 1) // BLOCK_BYTES))
@@ -513,33 +539,44 @@ def main():
             ss = dur * bi / n_blocks
             blen = dur * (bi + 1) / n_blocks - ss
             got = []
-            for attempt in (1, 2):
-                args = [ffmpeg, "-y", "-v", "error"]
-                if bi > 0:
-                    args += ["-ss", "%.3f" % ss]
-                args += ["-t", "%.3f" % blen]
-                args += ["-i", url, "-c", "copy", "-f", "segment",
-                         "-segment_time", str(seg), "-reset_timestamps", "1",
-                         "-segment_start_number", str(offset)]
-                if attempt > 1:
-                    # 关键帧稀疏时按时长切不动 -> 允许在非关键帧处切
-                    args += ["-break_non_keyframes", "1"]
-                args += [pat]
-                t = time.time()
-                r = sh(args, timeout=7200)
-                got = [p for p in sorted(glob.glob(os.path.join(parts_dir, stem_ + ".part*")))
-                       if os.path.getsize(p) >= 1024 * 1024]
-                total = sum(os.path.getsize(p) for p in got)
-                print("第 %d/%d 块切分(第%d次): 退出码=%d 用时 %.1f 分钟 %d 段 %s"
-                      % (bi + 1, n_blocks, attempt, r.returncode,
-                         (time.time() - t) / 60, len(got), human(total)))
-                if r.returncode == 0 and got and all(
-                        os.path.getsize(p) <= MAX_SEG_BYTES for p in got):
+            for src_try in (1, 2):
+                for attempt in (1, 2):
+                    args = [ffmpeg, "-y", "-v", "error"]
+                    if bi > 0:
+                        args += ["-ss", "%.3f" % ss]
+                    args += ["-t", "%.3f" % blen]
+                    args += ["-i", url, "-c", "copy", "-f", "segment",
+                             "-segment_time", str(seg), "-reset_timestamps", "1",
+                             "-segment_start_number", str(offset)]
+                    if attempt > 1:
+                        # 关键帧稀疏时按时长切不动 -> 允许在非关键帧处切
+                        args += ["-break_non_keyframes", "1"]
+                    args += [pat]
+                    t = time.time()
+                    r = sh(args, timeout=7200)
+                    got = [p for p in sorted(glob.glob(os.path.join(parts_dir, stem_ + ".part*")))
+                           if os.path.getsize(p) >= 1024 * 1024]
+                    total = sum(os.path.getsize(p) for p in got)
+                    print("第 %d/%d 块切分(第%d次): 退出码=%d 用时 %.1f 分钟 %d 段 %s"
+                          % (bi + 1, n_blocks, attempt, r.returncode,
+                             (time.time() - t) / 60, len(got), human(total)))
+                    if r.returncode == 0 and got and all(
+                            os.path.getsize(p) <= MAX_SEG_BYTES for p in got):
+                        break
+                    print("   失败: %s" % (r.stderr or "").strip()[:160])
+                    clean_parts()
+                    got = []
+                    seg = max(30, int(seg * 0.6))     # 段太大(关键帧稀疏) -> 收小再试
+                if got:
                     break
-                print("   失败: %s" % (r.stderr or "").strip()[:160])
-                clean_parts()
-                got = []
-                seg = max(30, int(seg * 0.6))     # 段太大(关键帧稀疏) -> 收小再试
+                # 直连 HTTP 直读切不出来(常见: 读到一半连接被截断) -> 整文件落地后重试本块
+                if src_try == 1 and url == url_remote:
+                    if not fetch_local():
+                        break
+                    url = os.path.join(workdir, name)   # 之后所有块都走本地文件
+                    print("   直连切分失败 -> 改用本地文件重试本块")
+                    continue
+                break
             if not got:
                 print("!! 第 %d 块切分失败, 停止该文件(不上传整文件)" % (bi + 1))
                 failed[stem(name)] = failed.get(stem(name), 0) + 1
