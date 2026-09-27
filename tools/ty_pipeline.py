@@ -298,7 +298,8 @@ def main():
     if a.only_name:
         todo = [x for x in todo if a.only_name in x["name"]]
         print("按 --only-name 过滤后: %d 个" % len(todo))
-    todo.sort(key=lambda x: x["size"])
+    # 失败过的优先重试(否则永远排在"按大小升序"的队尾, 吃不到); 其次按大小升序
+    todo.sort(key=lambda x: (0 if failed.get(stem(x["name"]), 0) > 0 else 1, x["size"]))
     print("in 共 %d 个 | 已标记 %d | 比对命中(重复) %d | 超 %.1fGB %d | 失败跳过 %d | 待处理 %d"
           % (len(files), skipped, len(dup), a.max_file_gb, big, len(skip_failed), len(todo)))
     if skip_failed:
@@ -446,7 +447,57 @@ def main():
         # 4.5 需要切分: 分块处理, 每块单独"切分 -> 逐段上传 -> 删", 峰值磁盘 = 1 块
         BLOCK_BYTES = 3.5 * 1024 ** 3
         if not dur:
-            print("!! 拿不到视频时长, 无法安全分块(易爆盘), 跳过该文件")
+            # 兜底: ffprobe 拿不到时长 -> 按大小切(segment_size), 无需 seek/时长
+            #   小文件(<1.05GB)对半切; 大文件按 SEG_TARGET 分段(1GB 会超 700MB 硬上限)
+            #   峰值磁盘 ≈ 整文件(上方已有磁盘前置检查, 不够会自动跳过)
+            fb = (f["size"] // 2) if f["size"] < 2.4 * SEG_TARGET else SEG_TARGET
+            print("兜底(拿不到时长 -> 按大小切): %.0f MB/段, 峰值磁盘 ≈ %s"
+                  % (fb / 1048576, human(f["size"])))
+            pat = os.path.join(parts_dir, stem_ + ".part%03d" + ext)
+            got = []
+            for attempt in (1, 2):
+                args = [ffmpeg, "-y", "-v", "error", "-i", url, "-c", "copy",
+                        "-f", "segment", "-segment_size", str(int(fb)),
+                        "-reset_timestamps", "1", "-segment_start_number", "0"]
+                if attempt > 1:
+                    # 第 2 次: 允许非关键帧处切 + 收小段长, 保证一定能切开
+                    args += ["-break_non_keyframes", "1"]
+                args += [pat]
+                t_fb = time.time()
+                r = sh(args, timeout=7200)
+                got = [p for p in sorted(glob.glob(os.path.join(parts_dir, stem_ + ".part*")))
+                       if os.path.getsize(p) >= 1024 * 1024]
+                total = sum(os.path.getsize(p) for p in got)
+                print("兜底切分(第%d次): 退出码=%d 用时 %.1f 分钟 %d 段 %s"
+                      % (attempt, r.returncode, (time.time() - t_fb) / 60,
+                         len(got), human(total)))
+                if r.returncode == 0 and got and all(
+                        os.path.getsize(p) <= MAX_SEG_BYTES for p in got):
+                    break
+                print("   失败: %s" % (r.stderr or "").strip()[:160])
+                clean_parts()
+                got = []
+                fb = max(64 * 1024 ** 2, fb * 0.6)
+            if not got:
+                print("!! 兜底切分失败, 停止该文件")
+                failed[stem(name)] = failed.get(stem(name), 0) + 1
+                print("   失败计数: %s -> %d 次 (达 %d 次后不再处理)"
+                      % (name, failed[stem(name)], FAIL_MAX))
+                shutil.rmtree(workdir, ignore_errors=True)
+                continue
+            if not upload_parts(got):
+                print("!! 兜底上传中断, 停止该文件")
+                failed[stem(name)] = failed.get(stem(name), 0) + 1
+                shutil.rmtree(workdir, ignore_errors=True)
+                continue
+            r = c.rename(f["id"], DONE_PREFIX + name, f["path"])
+            if str(r.get("code")) == "0":
+                print("✔ 源文件已标记: %s%s" % (DONE_PREFIX, name))
+                ok_cnt += 1
+            else:
+                print("!! 源文件标记失败(记入兜底): %s"
+                      % json.dumps(r, ensure_ascii=False)[:120])
+                new_done.add(stem(name))
             shutil.rmtree(workdir, ignore_errors=True)
             continue
         chunk = (f["size"] // 2) if (600 * 1024 ** 2) < f["size"] < (1024 ** 3) else SEG_TARGET
@@ -469,7 +520,11 @@ def main():
                 args += ["-t", "%.3f" % blen]
                 args += ["-i", url, "-c", "copy", "-f", "segment",
                          "-segment_time", str(seg), "-reset_timestamps", "1",
-                         "-segment_start_number", str(offset), pat]
+                         "-segment_start_number", str(offset)]
+                if attempt > 1:
+                    # 关键帧稀疏时按时长切不动 -> 允许在非关键帧处切
+                    args += ["-break_non_keyframes", "1"]
+                args += [pat]
                 t = time.time()
                 r = sh(args, timeout=7200)
                 got = [p for p in sorted(glob.glob(os.path.join(parts_dir, stem_ + ".part*")))
@@ -484,6 +539,7 @@ def main():
                 print("   失败: %s" % (r.stderr or "").strip()[:160])
                 clean_parts()
                 got = []
+                seg = max(30, int(seg * 0.6))     # 段太大(关键帧稀疏) -> 收小再试
             if not got:
                 print("!! 第 %d 块切分失败, 停止该文件(不上传整文件)" % (bi + 1))
                 failed[stem(name)] = failed.get(stem(name), 0) + 1
