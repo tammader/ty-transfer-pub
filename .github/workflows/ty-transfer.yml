@@ -6,11 +6,11 @@ name: ty-transfer
 # 需要仓库 Secrets: TY_AUTH / TY_CLOUD_ID / RCLONE_CONF
 
 on:
-  # 自动运行: 每 6 小时一次 (UTC 0/6/12/18 点 = 北京 8/14/20/2 点)
+  # 自动运行: 每 12 小时一次 (UTC 0/12 点 = 北京 8/20 点)   [2026-09-28 由 6h 调为 12h]
   #   公开仓库无需再抠额度, 所以单次预算放到 90 分钟(原 14 分钟是为了省私有仓库额度)。
   # 每轮都重新拉 中转远端/报告区 的比对清单, 再决定下载哪些文件
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */12 * * *"
   workflow_dispatch:
     inputs:
       max_files:
