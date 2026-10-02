@@ -1,0 +1,92 @@
+name: ydy2-transfer
+
+# 个人云盘(ydy2 账号) 的 /in -> 分卷 -> 目标远端 流水线
+# 说明: 与 ty-transfer 逻辑一致(比对判重 -> 直链切分 -> 逐段上传 + _D 标记), 差别只有:
+#   1. 源 = **个人云盘**(personal_new, 独立账号) 根目录下的 in
+#   2. 目标 = 目标远端/out (与 ty-transfer 相同, 真值走 Secret)
+#   3. 收尾 = 把源文件 **移入同级的 out**(上传完成 / 不能分割 / 编号已归档 三类都移),
+#      不再改名 "已下载_"
+# 需要仓库 Secrets: YDY_AUTHORIZATION / RCLONE_CONF / PATHS_JSON
+
+on:
+  # 每 12 小时一次 (UTC 0/12 = 北京 8:00 / 20:00)
+  #   公开仓库不计费, 单次预算 90 分钟; 每轮重新拉比对清单再决定下哪些
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      max_files:
+        description: "本次处理文件数上限"
+        required: false
+        default: "20"
+      max_file_gb:
+        description: "单文件大小上限 GB, 超过自动跳过"
+        required: false
+        default: "15"
+      only_name:
+        description: "只处理文件名含该子串的文件(留空=全部); 验证时很有用"
+        required: false
+        default: ""
+      max_minutes:
+        description: "单次运行时间预算(分钟)"
+        required: false
+        default: "90"
+      dry:
+        description: "true=演练(只比对/列计划, 不下载不上传不移动)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: ydy2-transfer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 ffmpeg 与 rclone
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1 || echo "ffprobe 缺失(有 fallback)"
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+          df -h / | tail -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
+
+      - name: 跑传输流水线
+        env:
+          YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
+          MAX_FILES: ${{ inputs.max_files || '20' }}
+          MAX_FILE_GB: ${{ inputs.max_file_gb || '15' }}
+          ONLY_NAME: ${{ inputs.only_name }}
+          MAX_MINUTES: ${{ inputs.max_minutes || '90' }}
+          DRY: ${{ inputs.dry || 'false' }}
+        run: |
+          set -e
+          DRY_ARG=""
+          if [ "$DRY" = "true" ]; then DRY_ARG="--dry"; fi
+          python3 tools/ydy2_pipeline.py $DRY_ARG \
+            --max-files "$MAX_FILES" --max-file-gb "$MAX_FILE_GB" \
+            --max-total-gb 80 --max-minutes "$MAX_MINUTES"
