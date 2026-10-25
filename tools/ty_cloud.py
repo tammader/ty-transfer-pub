@@ -8,11 +8,39 @@ import json
 import random
 import string
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 import pathcfg          # API 地址从配置读, 不在源码里写死
 BASE = pathcfg.require("TT_BASE")
+
+
+def open_retry(op, req, timeout, tries=4):
+    """网络抖动重试(2026-10-26 加)。
+
+    起因: runner 侧偶发 `socket.gaierror: [Errno -3] Temporary failure in name
+    resolution`, 一次 DNS 抽风就把整轮 12 小时的搬运打成 failure(#70/#51)。
+    这里只在「请求大概率没送达」的错误上重试(DNS/连不上/超时/5xx),
+    4xx 一律立刻抛(令牌失效、路径不对, 重试没意义)。
+    POST 的幂等性: list/getLink 是查询; rename 改的是同一个目标名, 重复执行等价。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            return op.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (408, 429) and e.code < 500:
+                raise
+            last = e
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+        if i < tries - 1:
+            wait = 3 * (2 ** i)
+            print("   !! 网络异常(%s), %ds 后重试(%d/%d)"
+                  % (str(last)[:110], wait, i + 1, tries - 1), flush=True)
+            time.sleep(wait)
+    raise last
 
 
 def cal_sign(body, ts, rand):
@@ -79,7 +107,7 @@ class TyCloud:
                 "x-DeviceInfo": "||9|7.14.0|chrome|120.0.0.0|||windows 10||zh-CN|||",
                 "Content-Type": "application/json",
             })
-        with self.op.open(req, timeout=90) as r:
+        with open_retry(self.op, req, timeout=90) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
 
     def new_json(self, data):
