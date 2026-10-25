@@ -23,12 +23,38 @@ import random
 import re
 import string
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 ROUTE_BASE = "https://user-njs.yun.139.com"
 REFRESH_URL = "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do"
 PERSONAL_MODULE = "personal"
+
+
+def open_retry(op, req, timeout, tries=4):
+    """网络抖动重试(2026-10-26 加)。
+
+    起因: runner 侧偶发 `socket.gaierror: [Errno -3] Temporary failure in name
+    resolution`, 一次 DNS 抽风就把整轮搬运打成 failure(#51)。
+    只重试「请求大概率没送达」的错误(DNS/连不上/超时/5xx), 4xx 立刻抛。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            return op.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (408, 429) and e.code < 500:
+                raise
+            last = e
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+        if i < tries - 1:
+            wait = 3 * (2 ** i)
+            print("   !! 网络异常(%s), %ds 后重试(%d/%d)"
+                  % (str(last)[:110], wait, i + 1, tries - 1), flush=True)
+            time.sleep(wait)
+    raise last
 
 
 def _enc(s):
@@ -104,7 +130,7 @@ class TyPersonal(object):
         }
         req = urllib.request.Request(url, data=body.encode("utf-8"),
                                      headers=headers, method="POST")
-        with self.op.open(req, timeout=180) as r:
+        with open_retry(self.op, req, timeout=180) as r:
             txt = r.read().decode("utf-8", "replace")
         try:
             return json.loads(txt)
